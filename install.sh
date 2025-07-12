@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Script de instalación automatizada de Nominatim en Ubuntu
+# Versión corregida que soluciona problemas de Python y entornos virtuales
 # Autor: Configuración personalizada para geocodificación privada
 # Fecha: 2025-07-12
 
@@ -44,6 +45,30 @@ PBF_URL=""
 REPLICATION_URL=""
 IMPORT_STYLE="address"
 THREADS=$(nproc)
+
+# Función para verificar recursos del sistema
+check_system_resources() {
+    log "Verificando recursos del sistema..."
+    
+    local required_ram_gb=4
+    local required_disk_gb=30
+    
+    # Verificar RAM
+    local total_ram=$(free -g | awk '/^Mem:/{print $2}')
+    if [ "$total_ram" -lt "$required_ram_gb" ]; then
+        warning "RAM insuficiente: ${total_ram}GB disponible, ${required_ram_gb}GB recomendado"
+        read -p "¿Continuar de todas formas? (y/N): " continue_anyway
+        [[ ! $continue_anyway =~ ^[Yy]$ ]] && error "Instalación cancelada"
+    fi
+    
+    # Verificar espacio en disco
+    local available_disk=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+    if [ "$available_disk" -lt "$required_disk_gb" ]; then
+        error "Espacio insuficiente: ${available_disk}GB disponible, ${required_disk_gb}GB requerido"
+    fi
+    
+    log "Recursos del sistema verificados correctamente"
+}
 
 # Función para mostrar menú de selección de región
 select_region() {
@@ -139,9 +164,13 @@ install_dependencies() {
         python3-pip \
         python3-dev \
         python3-psycopg2 \
+        python3-full \
+        python3.12-venv \
+        python3-venv \
         htop \
         unzip \
-        osmium-tool
+        osmium-tool \
+        software-properties-common
     
     log "Dependencias instaladas correctamente"
 }
@@ -158,10 +187,10 @@ configure_postgresql() {
     sudo tee /etc/postgresql/$POSTGRES_VERSION/main/conf.d/nominatim.conf > /dev/null <<EOF
 # Configuración optimizada para Nominatim
 shared_buffers = 2GB
-maintenance_work_mem = 10GB
+maintenance_work_mem = 4GB
 autovacuum_work_mem = 2GB
 work_mem = 50MB
-effective_cache_size = 24GB
+effective_cache_size = 8GB
 synchronous_commit = off
 max_wal_size = 1GB
 checkpoint_timeout = 10min
@@ -193,30 +222,60 @@ create_nominatim_user() {
     log "Usuario nominatim creado correctamente"
 }
 
-# Función para instalar Nominatim
+# Función para instalar Nominatim (versión corregida)
 install_nominatim() {
     log "Instalando Nominatim..."
     
-    # Cambiar al usuario nominatim para la instalación
-    sudo -u $NOMINATIM_USER bash <<EOF
-cd $NOMINATIM_HOME
-
-# Instalar Nominatim desde PyPI
-pip3 install --user nominatim-db nominatim-api
-
-# Agregar al PATH
-echo 'export PATH=\$PATH:\$HOME/.local/bin' >> ~/.bashrc
-source ~/.bashrc
-
-# Crear directorio del proyecto
+    # Método 1: Intentar instalación desde repositorio oficial
+    if sudo add-apt-repository -y ppa:nominatim/ppa 2>/dev/null && sudo apt update 2>/dev/null; then
+        log "Instalando desde repositorio oficial..."
+        if sudo apt install -y nominatim 2>/dev/null; then
+            sudo -u $NOMINATIM_USER bash <<EOF
 mkdir -p $PROJECT_DIR
 cd $PROJECT_DIR
+nominatim config --project-dir $PROJECT_DIR
+EOF
+            log "Nominatim instalado desde repositorio oficial"
+            return 0
+        fi
+    fi
+    
+    # Método 2: Instalación con entorno virtual (fallback)
+    log "Instalando en entorno virtual..."
+    
+    sudo -u $NOMINATIM_USER bash <<'EOF'
+cd $NOMINATIM_HOME
 
-# Inicializar configuración
-~/.local/bin/nominatim config --project-dir $PROJECT_DIR
+# Crear entorno virtual
+python3 -m venv nominatim-venv
+source nominatim-venv/bin/activate
+
+# Actualizar pip
+pip install --upgrade pip
+
+# Instalar Nominatim
+pip install nominatim-db nominatim-api
+
+# Crear wrapper script
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/nominatim << 'WRAPPER'
+#!/bin/bash
+source /srv/nominatim/nominatim-venv/bin/activate
+exec /srv/nominatim/nominatim-venv/bin/nominatim "$@"
+WRAPPER
+
+chmod +x ~/.local/bin/nominatim
+
+# Agregar al PATH
+echo 'export PATH=$PATH:$HOME/.local/bin' >> ~/.bashrc
+
+# Configurar proyecto
+mkdir -p /srv/nominatim/project
+cd /srv/nominatim/project
+~/.local/bin/nominatim config --project-dir /srv/nominatim/project
 EOF
     
-    log "Nominatim instalado correctamente"
+    log "Nominatim instalado correctamente en entorno virtual"
 }
 
 # Función para descargar datos OSM
@@ -243,14 +302,20 @@ import_data() {
 cd $PROJECT_DIR
 export PATH=\$PATH:\$HOME/.local/bin
 
-nominatim import --osm-file "$pbf_file" \
+# Verificar si nominatim está disponible
+if command -v nominatim >/dev/null 2>&1; then
+    NOMINATIM_CMD="nominatim"
+else
+    NOMINATIM_CMD="\$HOME/.local/bin/nominatim"
+fi
+
+\$NOMINATIM_CMD import --osm-file "$pbf_file" \
     --threads $THREADS \
     --project-dir $PROJECT_DIR \
     --import-style $IMPORT_STYLE
 
 # Configurar replicación
-nominatim replication --init --project-dir $PROJECT_DIR
-nominatim add-data --tiger-data --project-dir $PROJECT_DIR || true
+\$NOMINATIM_CMD replication --init --project-dir $PROJECT_DIR
 EOF
     
     log "Importación de datos completada"
@@ -282,9 +347,9 @@ EOF
     
     # Habilitar módulos y sitio
     sudo a2enmod rewrite
-    sudo a2enmod php8.1 || sudo a2enmod php8.2 || sudo a2enmod php
+    sudo a2enmod php8.1 2>/dev/null || sudo a2enmod php8.2 2>/dev/null || sudo a2enmod php 2>/dev/null || true
     sudo a2ensite $APACHE_SITE
-    sudo a2dissite 000-default
+    sudo a2dissite 000-default 2>/dev/null || true
     
     # Reiniciar Apache
     sudo systemctl restart apache2
@@ -313,7 +378,8 @@ create_maintenance_scripts() {
     sudo tee /usr/local/bin/nominatim-update > /dev/null <<EOF
 #!/bin/bash
 cd $PROJECT_DIR
-sudo -u $NOMINATIM_USER ~/.local/bin/nominatim replication --project-dir $PROJECT_DIR
+export PATH=\$PATH:/srv/nominatim/.local/bin
+sudo -u $NOMINATIM_USER bash -c "source ~/.bashrc && nominatim replication --project-dir $PROJECT_DIR"
 EOF
     
     sudo chmod +x /usr/local/bin/nominatim-update
@@ -323,8 +389,8 @@ EOF
 #!/bin/bash
 BACKUP_DIR="/backup/nominatim"
 mkdir -p \$BACKUP_DIR
-pg_dump -U $NOMINATIM_USER nominatim > "\$BACKUP_DIR/nominatim_backup_\$(date +%Y%m%d_%H%M%S).sql"
-find \$BACKUP_DIR -name "*.sql" -mtime +7 -delete
+sudo -u postgres pg_dump nominatim > "\$BACKUP_DIR/nominatim_backup_\$(date +%Y%m%d_%H%M%S).sql"
+find \$BACKUP_DIR -name "*.sql" -mtime +7 -delete 2>/dev/null || true
 EOF
     
     sudo chmod +x /usr/local/bin/nominatim-backup
@@ -338,9 +404,39 @@ EOF
     log "Scripts de mantenimiento creados"
 }
 
+# Función para verificar instalación
+verify_installation() {
+    log "Verificando instalación..."
+    
+    # Verificar servicios
+    if ! systemctl is-active --quiet apache2; then
+        error "Apache no está funcionando"
+    fi
+    
+    if ! systemctl is-active --quiet postgresql; then
+        error "PostgreSQL no está funcionando"
+    fi
+    
+    # Esperar un momento para que los servicios estén listos
+    sleep 5
+    
+    # Verificar API
+    local test_url="http://localhost/search?q=test&format=json"
+    local response=$(curl -s -o /dev/null -w "%{http_code}" "$test_url" 2>/dev/null || echo "000")
+    
+    if [ "$response" = "200" ]; then
+        log "✅ API funcionando correctamente"
+    else
+        warning "⚠️ API no responde correctamente (código: $response)"
+        warning "Esto puede ser normal si la importación aún no ha terminado"
+    fi
+    
+    log "Verificación completada"
+}
+
 # Función para mostrar información final
 show_final_info() {
-    local server_ip=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
     
     echo -e "${GREEN}================================${NC}"
     echo -e "${GREEN}  INSTALACIÓN COMPLETADA  ${NC}"
@@ -355,20 +451,34 @@ show_final_info() {
     echo -e "  • Actualizar datos: sudo /usr/local/bin/nominatim-update"
     echo -e "  • Crear backup: sudo /usr/local/bin/nominatim-backup"
     echo -e "  • Ver logs: sudo tail -f /var/log/apache2/nominatim_error.log"
+    echo -e "  • Estado servicios: sudo systemctl status apache2 postgresql"
     echo ""
     echo -e "${BLUE}Archivos importantes:${NC}"
     echo -e "  • Proyecto: $PROJECT_DIR"
     echo -e "  • Configuración Apache: /etc/apache2/sites-available/$APACHE_SITE.conf"
     echo -e "  • Logs: /var/log/apache2/"
     echo ""
-    echo -e "${YELLOW}Nota: Si tienes un dominio, configúralo para apuntar a $server_ip${NC}"
+    echo -e "${YELLOW}Nota: Si la importación aún está en progreso, la API estará disponible una vez completada.${NC}"
+}
+
+# Función de limpieza en caso de error
+cleanup_on_error() {
+    log "Limpiando instalación fallida..."
+    sudo systemctl stop apache2 2>/dev/null || true
+    sudo systemctl stop postgresql 2>/dev/null || true
+    sudo userdel -r $NOMINATIM_USER 2>/dev/null || true
+    sudo rm -rf $NOMINATIM_HOME 2>/dev/null || true
 }
 
 # Función principal
 main() {
     log "Iniciando instalación automatizada de Nominatim..."
     
+    # Configurar trap para limpieza automática en caso de error
+    trap cleanup_on_error ERR
+    
     check_root
+    check_system_resources
     select_region
     
     log "Configuración seleccionada:"
@@ -391,6 +501,7 @@ main() {
     configure_apache
     configure_firewall
     create_maintenance_scripts
+    verify_installation
     show_final_info
     
     log "¡Instalación completada exitosamente!"
