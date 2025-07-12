@@ -347,6 +347,7 @@ EOF
     
     # Habilitar módulos y sitio
     sudo a2enmod rewrite
+    # Esta línea busca la versión de PHP, ajusta si tu versión es diferente
     sudo a2enmod php8.1 2>/dev/null || sudo a2enmod php8.2 2>/dev/null || sudo a2enmod php 2>/dev/null || true
     sudo a2ensite $APACHE_SITE
     sudo a2dissite 000-default 2>/dev/null || true
@@ -396,6 +397,7 @@ EOF
     sudo chmod +x /usr/local/bin/nominatim-backup
     
     # Configurar cron jobs
+    # Se usa NOMINATIM_USER para el crontab para evitar problemas de permisos
     sudo -u $NOMINATIM_USER bash <<EOF
 (crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/nominatim-update") | crontab -
 (crontab -l 2>/dev/null; echo "0 3 * * 0 /usr/local/bin/nominatim-backup") | crontab -
@@ -466,8 +468,14 @@ cleanup_on_error() {
     log "Limpiando instalación fallida..."
     sudo systemctl stop apache2 2>/dev/null || true
     sudo systemctl stop postgresql 2>/dev/null || true
-    sudo userdel -r $NOMINATIM_USER 2>/dev/null || true
-    sudo rm -rf $NOMINATIM_HOME 2>/dev/null || true
+    # Solo eliminar usuario y directorio si fue creado por el script
+    if id "$NOMINATIM_USER" &>/dev/null; then
+        sudo userdel -r $NOMINATIM_USER 2>/dev/null || true
+    fi
+    if [ -d "$NOMINATIM_HOME" ]; then
+        sudo rm -rf $NOMINATIM_HOME 2>/dev/null || true
+    fi
+    log "Limpieza completada."
 }
 
 # Función principal
